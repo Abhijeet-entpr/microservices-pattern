@@ -1742,18 +1742,597 @@ sequenceDiagram
 
 **Redis Distributed Lock Implementation:**
 
+
+```java
+public RedisDistributedLock(StringRedisTemplate redisTemplate) {
+    this.redisTemplate = redisTemplate;
+    this.instanceId = generateInstanceId();
+}
+
+/**
+ * Acquires a distributed lock with default timeout
+ * 
+ * @param lockKey The resource to lock
+ * @return A LockContext if successful, null otherwise
+ */
+public LockContext acquire(String lockKey) {
+    return acquire(lockKey, DEFAULT_TIMEOUT_MS);
+}
+
+/**
+ * Acquires a distributed lock with specified timeout
+ * 
+ * @param lockKey The resource to lock
+ * @param timeoutMs Lock expiry time in milliseconds
+ * @return A LockContext if successful, null otherwise
+ */
+public LockContext acquire(String lockKey, long timeoutMs) {
+    return acquire(lockKey, timeoutMs, DEFAULT_RETRY_COUNT, DEFAULT_RETRY_DELAY_MS);
+}
+
+/**
+ * Acquires a distributed lock with full retry parameters
+ * 
+ * @param lockKey The resource to lock
+ * @param timeoutMs Lock expiry time in milliseconds
+ * @param retryCount Maximum number of acquisition attempts
+ * @param retryDelayMs Delay between retry attempts
+ * @return A LockContext if successful, null otherwise
+ */
+public LockContext acquire(String lockKey, long timeoutMs, int retryCount, long retryDelayMs) {
+    final String fullLockKey = LOCK_PREFIX + lockKey;
+    final String token = generateLockToken();
+    final String lockValue = instanceId + ":" + token;
+    
+    LOG.debug("Attempting to acquire lock: {} with timeout: {}ms", fullLockKey, timeoutMs);
+    
+    // Try initial lock acquisition
+    boolean acquired = setLock(fullLockKey, lockValue, timeoutMs);
+    
+    // Retry logic if configured
+    int attempts = 0;
+    while (!acquired && attempts < retryCount) {
+        attempts++;
+        try {
+            LOG.debug("Lock acquisition failed, retrying {}/{} after {}ms", 
+                     attempts, retryCount, retryDelayMs);
+            Thread.sleep(retryDelayMs);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Lock acquisition interrupted", e);
+            return null;
+        }
+        acquired = setLock(fullLockKey, lockValue, timeoutMs);
+    }
+    
+    if (acquired) {
+        LOG.debug("Successfully acquired lock: {} with value: {}", fullLockKey, lockValue);
+        return new LockContext(fullLockKey, lockValue);
+    } else {
+        LOG.debug("Failed to acquire lock: {} after {} attempts", fullLockKey, attempts + 1);
+        return null;
+    }
+}
+
+/**
+ * Releases a previously acquired lock
+ * 
+ * @param lockContext The lock context returned from acquire
+ * @return true if successfully released, false otherwise
+ */
+public boolean release(LockContext lockContext) {
+    if (lockContext == null) {
+        return false;
+    }
+    
+    String lockKey = lockContext.getLockKey();
+    String expectedValue = lockContext.getLockValue();
+    
+    LOG.debug("Attempting to release lock: {} with value: {}", lockKey, expectedValue);
+    
+    // Execute Lua script for secure release (only if we still own the lock)
+    String script = 
+        "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+        "    return redis.call('del', KEYS[1]) " +
+        "else " +
+        "    return 0 " +
+        "end";
+    
+    RedisCallback<Boolean> callback = connection -> {
+        Object result = connection.eval(
+            script.getBytes(),
+            ReturnType.INTEGER,
+            1,
+            lockKey.getBytes(),
+            expectedValue.getBytes()
+        );
+        return result != null && result.equals(1L);
+    };
+    
+    Boolean released = redisTemplate.execute(callback);
+    
+    if (Boolean.TRUE.equals(released)) {
+        LOG.debug("Successfully released lock: {}", lockKey);
+        return true;
+    } else {
+        LOG.warn("Failed to release lock: {} - lock not owned or already expired", lockKey);
+        return false;
+    }
+}
+
+/**
+ * Extends the expiry time of an existing lock
+ * 
+ * @param lockContext The lock context returned from acquire
+ * @param extensionTimeMs Additional milliseconds to extend lock by
+ * @return true if successfully extended, false otherwise
+ */
+public boolean extend(LockContext lockContext, long extensionTimeMs) {
+    if (lockContext == null) {
+        return false;
+    }
+    
+    String lockKey = lockContext.getLockKey();
+    String expectedValue = lockContext.getLockValue();
+    
+    LOG.debug("Attempting to extend lock: {} by {}ms", lockKey, extensionTimeMs);
+    
+    // Execute Lua script to extend lock only if we still own it
+    String script = 
+        "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+        "    return redis.call('pexpire', KEYS[1], ARGV[2]) " +
+        "else " +
+        "    return 0 " +
+        "end";
+    
+    RedisCallback<Boolean> callback = connection -> {
+        Object result = connection.eval(
+            script.getBytes(),
+            ReturnType.INTEGER,
+            1,
+            lockKey.getBytes(),
+            expectedValue.getBytes(),
+            String.valueOf(extensionTimeMs).getBytes()
+        );
+        return result != null && result.equals(1L);
+    };
+    
+    Boolean extended = redisTemplate.execute(callback);
+    
+    if (Boolean.TRUE.equals(extended)) {
+        LOG.debug("Successfully extended lock: {} by {}ms", lockKey, extensionTimeMs);
+        return true;
+    } else {
+        LOG.warn("Failed to extend lock: {} - lock not owned or already expired", lockKey);
+        return false;
+    }
+}
+
+/**
+ * Executes a task within a distributed lock
+ * 
+ * @param lockKey The resource to lock
+ * @param task The task to execute when lock is acquired
+ * @param <T> The return type of the task
+ * @return The result of the task, or empty if lock couldn't be acquired
+ */
+public <T> Optional<T> executeWithLock(String lockKey, Supplier<T> task) {
+    return executeWithLock(lockKey, DEFAULT_TIMEOUT_MS, task);
+}
+
+/**
+ * Executes a task within a distributed lock with timeout
+ * 
+ * @param lockKey The resource to lock
+ * @param timeoutMs Lock timeout in milliseconds
+ * @param task The task to execute when lock is acquired
+ * @param <T> The return type of the task
+ * @return The result of the task, or empty if lock couldn't be acquired
+ */
+public <T> Optional<T> executeWithLock(String lockKey, long timeoutMs, Supplier<T> task) {
+    LockContext lockContext = acquire(lockKey, timeoutMs);
+    if (lockContext == null) {
+        return Optional.empty();
+    }
+    
+    try {
+        T result = task.get();
+        return Optional.ofNullable(result);
+    } finally {
+        release(lockContext);
+    }
+}
+
+private boolean setLock(String lockKey, String lockValue, long timeoutMs) {
+    Boolean result = redisTemplate.opsForValue()
+        .setIfAbsent(lockKey, lockValue, Duration.ofMillis(timeoutMs));
+    return Boolean.TRUE.equals(result);
+}
+
+private String generateLockToken() {
+    return UUID.randomUUID().toString();
+}
+
+private String generateInstanceId() {
+    try {
+        String hostname = InetAddress.getLocalHost().getHostName();
+        return hostname + "-" + UUID.randomUUID().toString().substring(0, 8);
+    } catch (UnknownHostException e) {
+        return "instance-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+}
+
+/**
+ * Context object holding information about an acquired lock
+ */
+@Getter
+public static class LockContext {
+    private final String lockKey;
+    private final String lockValue;
+    
+    public LockContext(String lockKey, String lockValue) {
+        this.lockKey = lockKey;
+        this.lockValue = lockValue;
+    }
+}
+```
+
+### Using the Distributed Lock
+
 ```java
 @Service
-public class RedisDistributedLock {
+public class PaymentProcessingService {
     
-    private static final Logger LOG = LoggerFactory.getLogger(RedisDistributedLock.class);
-    private static final String LOCK_PREFIX = "lock:";
+    private static final Logger LOG = LoggerFactory.getLogger(PaymentProcessingService.class);
+    private static final String PAYMENT_LOCK_PREFIX = "payment:";
+    
+    private final RedisDistributedLock lockService;
+    private final PaymentRepository paymentRepository;
+    private final PaymentGateway paymentGateway;
+    
+    public PaymentProcessingService(
+            RedisDistributedLock lockService,
+            PaymentRepository paymentRepository,
+            PaymentGateway paymentGateway) {
+        this.lockService = lockService;
+        this.paymentRepository = paymentRepository;
+        this.paymentGateway = paymentGateway;
+    }
+    
+    /**
+     * Process a payment with distributed locking to prevent duplicate processing
+     */
+    public PaymentResult processPayment(String paymentId, BigDecimal amount) {
+        String lockKey = PAYMENT_LOCK_PREFIX + paymentId;
+        
+        // Try to acquire lock with 30 second timeout
+        Optional<PaymentResult> result = lockService.executeWithLock(
+            lockKey, 
+            30000, 
+            () -> doProcessPayment(paymentId, amount)
+        );
+        
+        return result.orElseGet(() -> {
+            LOG.warn("Could not acquire lock for payment: {}", paymentId);
+            return PaymentResult.builder()
+                .status(PaymentStatus.FAILED)
+                .error("Payment already being processed")
+                .build();
+        });
+    }
+    
+    /**
+     * Process a batch of payments concurrently with locks
+     */
+    public List<PaymentResult> processBatchPayments(List<Payment> payments) {
+        return payments.parallelStream()
+            .map(payment -> {
+                String lockKey = PAYMENT_LOCK_PREFIX + payment.getId();
+                
+                return lockService.executeWithLock(
+                    lockKey,
+                    () -> doProcessPayment(payment.getId(), payment.getAmount())
+                ).orElseGet(() -> {
+                    LOG.warn("Could not acquire lock for payment: {}", payment.getId());
+                    return PaymentResult.builder()
+                        .paymentId(payment.getId())
+                        .status(PaymentStatus.FAILED)
+                        .error("Payment already being processed")
+                        .build();
+                });
+            })
+            .collect(Collectors.toList());
+    }
+    
+    private PaymentResult doProcessPayment(String paymentId, BigDecimal amount) {
+        LOG.info("Processing payment: {} for amount: {}", paymentId, amount);
+        
+        // Check if already processed
+        Optional<Payment> existingPayment = paymentRepository.findById(paymentId);
+        if (existingPayment.isPresent() && existingPayment.get().isProcessed()) {
+            LOG.warn("Payment already processed: {}", paymentId);
+            return PaymentResult.builder()
+                .paymentId(paymentId)
+                .status(PaymentStatus.ALREADY_PROCESSED)
+                .error("Payment already processed")
+                .build();
+        }
+        
+        try {
+            // Call payment gateway
+            GatewayResponse response = paymentGateway.processPayment(paymentId, amount);
+            
+            // Update repository
+            paymentRepository.updatePaymentStatus(
+                paymentId, 
+                response.isSuccessful() ? PaymentStatus.COMPLETED : PaymentStatus.FAILED,
+                response.getTransactionId(),
+                response.getMessage()
+            );
+            
+            return PaymentResult.builder()
+                .paymentId(paymentId)
+                .status(response.isSuccessful() ? PaymentStatus.COMPLETED : PaymentStatus.FAILED)
+                .transactionId(response.getTransactionId())
+                .message(response.getMessage())
+                .build();
+        } catch (Exception e) {
+            LOG.error("Error processing payment: {}", paymentId, e);
+            
+            // Update repository with error
+            paymentRepository.updatePaymentStatus(
+                paymentId,
+                PaymentStatus.FAILED,
+                null,
+                e.getMessage()
+            );
+            
+            return PaymentResult.builder()
+                .paymentId(paymentId)
+                .status(PaymentStatus.FAILED)
+                .error(e.getMessage())
+                .build();
+        }
+    }
+}
+```
+
+### Advanced Redis Distributed Lock with Redlock Algorithm
+
+For mission-critical applications where lock reliability is paramount, the Redlock algorithm provides enhanced guarantees by using multiple independent Redis instances:
+
+```java
+@Service
+public class RedisRedlockService {
+    
+    private static final Logger LOG = LoggerFactory.getLogger(RedisRedlockService.class);
+    private static final String LOCK_PREFIX = "redlock:";
     private static final long DEFAULT_TIMEOUT_MS = 30000; // 30 seconds
     private static final long DEFAULT_RETRY_DELAY_MS = 200;
     private static final int DEFAULT_RETRY_COUNT = 3;
     
-    private final StringRedisTemplate redisTemplate;
+    private final List<StringRedisTemplate> redisInstances;
     private final String instanceId;
+    private final Random random;
     
-    public RedisDistributedLock(StringRedisTemplate redisTemplate) {
-        this.re
+    public RedisRedlockService(List<StringRedisTemplate> redisInstances) {
+        this.redisInstances = redisInstances;
+        this.instanceId = generateInstanceId();
+        this.random = new Random();
+    }
+    
+    /**
+     * Acquires a distributed lock using the Redlock algorithm across multiple Redis instances
+     * 
+     * @param lockKey The resource to lock
+     * @param timeoutMs Lock expiry time in milliseconds
+     * @return A LockContext if successful, null otherwise
+     */
+    public LockContext acquire(String lockKey, long timeoutMs) {
+        final String fullLockKey = LOCK_PREFIX + lockKey;
+        final String token = generateLockToken();
+        final String lockValue = instanceId + ":" + token;
+        
+        LOG.debug("Attempting to acquire redlock: {} with timeout: {}ms", fullLockKey, timeoutMs);
+        
+        // Calculate majority quorum
+        int quorum = redisInstances.size() / 2 + 1;
+        
+        // Track successful lock acquisitions
+        List<Integer> acquiredInstances = new ArrayList<>();
+        
+        // Start time for drift calculation
+        long startTime = System.currentTimeMillis();
+        
+        try {
+            // Try to acquire the lock in all instances
+            for (int i = 0; i < redisInstances.size(); i++) {
+                StringRedisTemplate redis = redisInstances.get(i);
+                if (setLock(redis, fullLockKey, lockValue, timeoutMs)) {
+                    acquiredInstances.add(i);
+                }
+            }
+            
+            // Calculate elapsed time
+            long elapsedTime = System.currentTimeMillis() - startTime;
+            
+            // Check if we have a quorum and the lock is still valid
+            boolean validityTimeCheck = elapsedTime < timeoutMs;
+            boolean quorumAcquired = acquiredInstances.size() >= quorum;
+            
+            if (quorumAcquired && validityTimeCheck) {
+                LOG.debug("Successfully acquired redlock: {} with quorum: {}/{}", 
+                         fullLockKey, acquiredInstances.size(), redisInstances.size());
+                return new LockContext(fullLockKey, lockValue, acquiredInstances);
+            } else {
+                LOG.debug("Failed to acquire redlock: {} - Got {}/{} instances, elapsed: {}ms", 
+                         fullLockKey, acquiredInstances.size(), redisInstances.size(), elapsedTime);
+                
+                // Release partially acquired locks
+                for (Integer instanceIndex : acquiredInstances) {
+                    releaseSingleLock(redisInstances.get(instanceIndex), fullLockKey, lockValue);
+                }
+                
+                return null;
+            }
+        } catch (Exception e) {
+            LOG.error("Error acquiring redlock: {}", fullLockKey, e);
+            
+            // Release partially acquired locks
+            for (Integer instanceIndex : acquiredInstances) {
+                try {
+                    releaseSingleLock(redisInstances.get(instanceIndex), fullLockKey, lockValue);
+                } catch (Exception ex) {
+                    LOG.warn("Error releasing partial lock on instance: {}", instanceIndex, ex);
+                }
+            }
+            
+            return null;
+        }
+    }
+    
+    /**
+     * Releases a previously acquired redlock
+     * 
+     * @param lockContext The lock context returned from acquire
+     * @return true if successfully released, false otherwise
+     */
+    public boolean release(LockContext lockContext) {
+        if (lockContext == null) {
+            return false;
+        }
+        
+        String lockKey = lockContext.getLockKey();
+        String expectedValue = lockContext.getLockValue();
+        List<Integer> acquiredInstances = lockContext.getAcquiredInstances();
+        
+        LOG.debug("Attempting to release redlock: {} from {} instances", 
+                 lockKey, acquiredInstances.size());
+        
+        boolean allReleased = true;
+        for (Integer instanceIndex : acquiredInstances) {
+            try {
+                StringRedisTemplate redis = redisInstances.get(instanceIndex);
+                boolean released = releaseSingleLock(redis, lockKey, expectedValue);
+                if (!released) {
+                    allReleased = false;
+                }
+            } catch (Exception e) {
+                LOG.error("Error releasing lock on instance: {}", instanceIndex, e);
+                allReleased = false;
+            }
+        }
+        
+        return allReleased;
+    }
+    
+    /**
+     * Executes a task within a redlock
+     * 
+     * @param lockKey The resource to lock
+     * @param timeoutMs Lock timeout in milliseconds
+     * @param task The task to execute when lock is acquired
+     * @param <T> The return type of the task
+     * @return The result of the task, or empty if lock couldn't be acquired
+     */
+    public <T> Optional<T> executeWithLock(String lockKey, long timeoutMs, Supplier<T> task) {
+        LockContext lockContext = acquire(lockKey, timeoutMs);
+        if (lockContext == null) {
+            return Optional.empty();
+        }
+        
+        try {
+            T result = task.get();
+            return Optional.ofNullable(result);
+        } finally {
+            release(lockContext);
+        }
+    }
+    
+    private boolean setLock(StringRedisTemplate redis, String lockKey, String lockValue, long timeoutMs) {
+        try {
+            Boolean result = redis.opsForValue()
+                .setIfAbsent(lockKey, lockValue, Duration.ofMillis(timeoutMs));
+            return Boolean.TRUE.equals(result);
+        } catch (Exception e) {
+            LOG.warn("Error setting lock on redis instance", e);
+            return false;
+        }
+    }
+    
+    private boolean releaseSingleLock(StringRedisTemplate redis, String lockKey, String expectedValue) {
+        String script = 
+            "if redis.call('get', KEYS[1]) == ARGV[1] then " +
+            "    return redis.call('del', KEYS[1]) " +
+            "else " +
+            "    return 0 " +
+            "end";
+        
+        try {
+            RedisCallback<Boolean> callback = connection -> {
+                Object result = connection.eval(
+                    script.getBytes(),
+                    ReturnType.INTEGER,
+                    1,
+                    lockKey.getBytes(),
+                    expectedValue.getBytes()
+                );
+                return result != null && result.equals(1L);
+            };
+            
+            Boolean released = redis.execute(callback);
+            return Boolean.TRUE.equals(released);
+        } catch (Exception e) {
+            LOG.warn("Error releasing lock", e);
+            return false;
+        }
+    }
+    
+    private String generateLockToken() {
+        return UUID.randomUUID().toString();
+    }
+    
+    private String generateInstanceId() {
+        try {
+            String hostname = InetAddress.getLocalHost().getHostName();
+            return hostname + "-" + UUID.randomUUID().toString().substring(0, 8);
+        } catch (UnknownHostException e) {
+            return "instance-" + UUID.randomUUID().toString().substring(0, 8);
+        }
+    }
+    
+    /**
+     * Context object holding information about an acquired redlock
+     */
+    @Getter
+    public static class LockContext {
+        private final String lockKey;
+        private final String lockValue;
+        private final List<Integer> acquiredInstances;
+        
+        public LockContext(String lockKey, String lockValue, List<Integer> acquiredInstances) {
+            this.lockKey = lockKey;
+            this.lockValue = lockValue;
+            this.acquiredInstances = acquiredInstances;
+        }
+    }
+}
+```
+
+**Key Benefits:**
+
+* Provides mutual exclusion across distributed services
+* Prevents race conditions for shared resources
+* Enables synchronized access to external systems
+* Supports automatic lock expiry for deadlock prevention
+* Can include reentrant lock capabilities
+* Facilitates coordinated distributed processing
+
+**Potential Drawbacks / Considerations:**
+
+* Needs to handle lock expiry and recovery properly
+* Must account for network partitions and timeouts
+* Lock service becomes a critical dependency
+* Can introduce latency due to network communication
+* Requires careful handling of lock release in failure scenarios
+* May need fencing tokens to handle "zombie" lock holders
